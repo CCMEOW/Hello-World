@@ -112,6 +112,8 @@ class Fruit:
         self.name, self.zs, self.color = name, zs, color
         self.stem, self.calyx, self.warp_kind, self.seeds = stem, calyx, warp, seeds
         self.sepals = sepals    # dried calyx star at the bottom: (count, length, root r)
+        self.calyx_lift = 0.0   # raise calyx leaves (e.g. to sit on top of a cream layer)
+        self.seed_ymax = 1e9    # no strawberry seeds above this height
         self.seg = seg
 
         # outer profile: bottom axis -> side -> top axis, x = radius, y = height
@@ -260,7 +262,7 @@ class Fruit:
         for i in range(n):
             s = top_skip + (L - top_skip - 6) * (i + 0.5) / n
             x, y, nx, ny = self.from_top(s)
-            if x < 5 or abs(y - self.zs) < 2.4 or y < 5:
+            if x < 5 or abs(y - self.zs) < 2.4 or y < 5 or y > self.seed_ymax:
                 continue
             a = i * ga
             cx, cz = x + 0.45 * nx, y + 0.45 * ny
@@ -288,13 +290,13 @@ class Fruit:
                 s = v[:, 0]
                 x, y, nx, ny = fr.from_top(s)
                 curl = 0.6 * np.clip((s - L * 0.7) / (L * 0.3), 0, 1) ** 2 * (1 + 0.5 * math.sin(k))
-                w = v[:, 2] + curl
+                w = v[:, 2] + curl + fr.calyx_lift
                 phi = phi0 + v[:, 1] / np.maximum(x, 3.0)
                 rad = x + w * nx
                 return np.c_[rad * np.cos(phi), rad * np.sin(phi), y + w * ny]
             parts.append(leaf.warp_batch(f))
         top = self.from_top(0.0)[1]
-        hub = Manifold.cylinder(2.5, 4.5, 4.0, 32).translate((0, 0, top - 1.5))
+        hub = Manifold.cylinder(2.5, 4.5, 4.0, 32).translate((0, 0, top - 1.5 + self.calyx_lift))
         parts.append(hub)
         return Manifold.batch_boolean(parts, m3d.OpType.Add)
 
@@ -427,7 +429,7 @@ FRUITS = [
 
 
 def main():
-    out = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(__file__), 'stl')
+    out = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(os.path.abspath(__file__)), 'stl', 'plain')
     os.makedirs(out, exist_ok=True)
     report = []
     for fr in FRUITS:
