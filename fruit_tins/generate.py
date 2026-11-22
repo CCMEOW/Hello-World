@@ -4,18 +4,19 @@ Fruit tin boxes for 3D printing (apple / pear / peach / orange / strawberry)
 plus a separate foam-net style sleeve for every fruit.
 
 Every fruit is split into
-  * <fruit>_base.stl  - lower bowl with an inner locating lip (print open side up)
+  * <fruit>_base.stl  - lower bowl with a locating lip (print open side up)
   * <fruit>_lid.stl   - upper cap, slips over the lip (print open side down)
   * <fruit>_net.stl   - diamond lattice sleeve that the fruit sits in
 Strawberry and orange also export the green calyx alone (<fruit>_calyx.stl),
 already positioned on the lid, for multi-material printing / painting masks.
 
-Design rules used so that parts print WITHOUT supports:
-  * the lid's inner ceiling is a cone (<= ~49 deg from vertical)
-  * the bottom of each fruit has a flat foot and is limited to ~58 deg overhang
-  * net strands rise at <= ~48 deg, the bottom ring sits on the bed
+Like the real tins, base and lid are thin shells of even thickness that follow
+the fruit shape inside and out, and the outside keeps the natural fruit form
+(apple calyx basin with sepals, stem cavities, peach suture, orange peel ...).
+Base and lid therefore need supports (tree supports, build plate only).
+The nets print without supports (strands rise at <= ~48 deg).
 
-Requires: pip install manifold3d numpy trimesh
+Requires: pip install manifold3d numpy
 Usage:    python3 generate.py [output_dir]
 """
 import os
@@ -29,9 +30,7 @@ from manifold3d import Manifold, CrossSection
 WALL = 1.6          # wall thickness (mm)
 CLEAR = 0.20        # radial clearance between lip and lid
 LIP_H = 6.0         # lip height
-LIP_W = 1.6         # lip thickness
-CONE_S = 1.15       # lid ceiling: horizontal per vertical (1.15 ~ 49 deg)
-FOOT_K = 1.60       # bottom overhang limit: horizontal per vertical (~58 deg)
+LIP_W = 1.2         # lip thickness
 SEG = 192           # circular segments for fruits
 
 NET_RS = 1.5        # net strand radius (3 mm strands)
@@ -109,9 +108,10 @@ def save(man, path):
 # ------------------------------------------------------------------ fruit
 class Fruit:
     def __init__(self, name, ctrl, zs, color, stem=None, calyx=None,
-                 warp=None, seeds=False, seg=SEG):
+                 warp=None, seeds=False, sepals=None, seg=SEG):
         self.name, self.zs, self.color = name, zs, color
         self.stem, self.calyx, self.warp_kind, self.seeds = stem, calyx, warp, seeds
+        self.sepals = sepals    # dried calyx star at the bottom: (count, length, root r)
         self.seg = seg
 
         # outer profile: bottom axis -> side -> top axis, x = radius, y = height
@@ -119,9 +119,6 @@ class Fruit:
         c[:, 0] = np.maximum(c[:, 0], 0)
         c[0, 0] = c[-1, 0] = 0.0
         c[:, 1] -= c[:, 1].min()
-        # bottom overhang limit (only bites in the lowest few mm)
-        foot = ctrl[1][0]
-        c[:, 0] = np.minimum(c[:, 0], foot + c[:, 1] * FOOT_K)
         self.curve = c
         self.H = c[:, 1].max()
 
@@ -133,18 +130,13 @@ class Fruit:
         self.inner_curves = [closed(np.asarray(p)) for p in self.inner.to_polygons()]
         self.outer_curves = [closed(np.vstack([c, [[0, c[-1, 1]], [0, 0]]]))]
 
-        # lid ceiling cone apex: keep the whole cone inside the inner offset
-        pts = np.vstack(self.inner_curves)
-        pts = pts[pts[:, 1] >= zs]
-        self.zc = float(np.min(pts[:, 1] + pts[:, 0] / CONE_S))
-
-        # lip radius: fits inside the lid cavity over the lip height
+        # lip radius: fits inside the lid shell over the lip height
         zz = np.linspace(zs, zs + LIP_H, 25)
-        lid_r = [min(max_x_at(self.inner_curves, z), (self.zc - z) * CONE_S) for z in zz]
-        self.lip_out = min(lid_r) - CLEAR
+        self.lip_out = min(max_x_at(self.inner_curves, z) for z in zz) - CLEAR
         self.lip_in = self.lip_out - LIP_W
-        if self.zc - self.lip_out / CONE_S < zs + LIP_H:
-            print(f'  ! {name}: lid ceiling cone clips the lip region')
+
+        # outer profile as segments (for "is this vertex on the outer skin")
+        self.seg_a, self.seg_b = c[:-1], c[1:]
 
     # ---- outer radius at height z (for nets & texture masks)
     def r_out(self, z):
@@ -162,13 +154,43 @@ class Fruit:
         # walking from the top down the side, outward normal = tangent rotated +90deg
         return x, y, -ty / ln, tx / ln
 
-    # ---- 2D sections
+    # ---- point on outer surface at arc length s measured from the bottom axis
+    def from_bottom(self, s):
+        c = self.curve
+        d = np.r_[0, np.cumsum(np.linalg.norm(np.diff(c, axis=0), axis=1))]
+        x = np.interp(s, d, c[:, 0])
+        y = np.interp(s, d, c[:, 1])
+        tx = np.interp(s, d, np.gradient(c[:, 0], d))
+        ty = np.interp(s, d, np.gradient(c[:, 1], d))
+        ln = np.hypot(tx, ty) + 1e-9
+        return x, y, ty / ln, -tx / ln
+
+    # ---- nearest point on the outer profile for (r, z) pairs
+    def outer_skin(self, r, z, chunk=4000):
+        a, b = self.seg_a, self.seg_b
+        ab = b - a
+        L2 = np.maximum((ab ** 2).sum(1), 1e-12)
+        nrm = np.c_[ab[:, 1], -ab[:, 0]] / np.sqrt(L2)[:, None]   # outward (CW profile)
+        dist = np.empty(len(r)); nr = np.empty(len(r)); nz = np.empty(len(r))
+        for i in range(0, len(r), chunk):
+            p = np.c_[r[i:i + chunk], z[i:i + chunk]]
+            ap = p[:, None, :] - a[None]
+            t = np.clip((ap * ab[None]).sum(2) / L2[None], 0, 1)
+            q = a[None] + t[..., None] * ab[None]
+            dd = ((p[:, None, :] - q) ** 2).sum(2)
+            j = dd.argmin(1)
+            dist[i:i + chunk] = np.sqrt(dd[np.arange(len(j)), j])
+            nr[i:i + chunk], nz[i:i + chunk] = nrm[j, 0], nrm[j, 1]
+        return dist, nr, nz
+
+    # ---- 2D sections: even shells, like the tin
     def base_2d(self):
         zs = self.zs
         outer = self.P ^ rect(0, -1, 500, zs)
-        chamfer = poly([(0, -1000), (self.lip_in + zs + 1000, -1000),
-                        (self.lip_in, zs), (0, zs)])
-        cavity = self.inner ^ chamfer ^ rect(0, -1, 500, zs + 1)
+        # the shell follows the fruit; only the last few mm curl in to carry the lip
+        neck = poly([(0, -1000), (self.lip_in + zs + 1000, -1000),
+                     (self.lip_in, zs), (0, zs)])
+        cavity = self.inner ^ neck ^ rect(0, -1, 500, zs + 1)
         lip = poly([(self.lip_in, zs - 0.01), (self.lip_out, zs - 0.01),
                     (self.lip_out, zs + LIP_H - 0.6),
                     (self.lip_out - 0.6, zs + LIP_H), (self.lip_in, zs + LIP_H)])
@@ -177,16 +199,13 @@ class Fruit:
     def lid_2d(self):
         zs = self.zs
         outer = self.P ^ rect(0, zs, 500, 500)
-        cone = poly([(0, -1000), ((self.zc + 1000) * CONE_S, -1000), (0, self.zc)])
-        cavity = self.inner ^ cone ^ rect(0, zs - 1, 500, 500)
+        cavity = self.inner ^ rect(0, zs - 1, 500, 500)
         return outer - cavity
 
     # ---- surface decoration -------------------------------------------
     def apply_warp(self, man):
         if self.warp_kind is None:
             return man
-        zg = np.linspace(0, self.H, 600)
-        rg = np.array([self.r_out(z) for z in zg])
         kind, fr = self.warp_kind, self
 
         def f(v):
@@ -194,21 +213,39 @@ class Fruit:
             r = np.hypot(v[:, 0], v[:, 1])
             th = np.arctan2(v[:, 1], v[:, 0])
             z = v[:, 2]
-            if kind == 'peach':
-                # suture crease down one side, deeper toward the top
-                w = 0.13 + 0.10 * (1 - z / fr.H)
-                d = -2.6 * np.exp(-(th / w) ** 2) * np.clip((z - 4) / (fr.H * 0.5), 0, 1)
+            dz = 0.0
+            if kind == 'apple':
+                # five soft lobes around the calyx basin and around the stem cavity
+                bot = np.exp(-((z - 9) / 8) ** 2)
+                top = np.exp(-((z - (fr.H - 5)) / 6) ** 2)
+                d = (1.0 * bot + 0.7 * top) * np.cos(5 * th) * np.clip(r / 14, 0, 1) ** 2
+            elif kind == 'pear':
+                # pears are never quite round: a gentle bulge + lean of the neck
+                d = 0.9 * np.cos(th - 0.6) * np.clip((z - 8) / 25, 0, 1) \
+                    + 0.5 * np.cos(3 * th + 1.0) * np.exp(-((z - 18) / 10) ** 2)
+                d = d * np.clip(r / 10, 0, 1)
+            elif kind == 'peach':
+                # suture crease from the stem cavity down one side
+                w = 0.12 + 0.08 * (1 - z / fr.H)
+                d = -2.4 * np.exp(-(th / w) ** 2) * np.clip((z - 6) / (fr.H * 0.45), 0, 1)
                 d *= np.clip(r / 6, 0, 1)
+                # one cheek fuller than the other
+                d = d + 0.8 * np.sin(th) * np.clip(r / 20, 0, 1) * np.exp(-((z - 30) / 18) ** 2)
             elif kind == 'orange':
-                outer = r > np.interp(z, zg, rg) - 0.4
-                n = (np.sin(th * 41 + z * 0.9) * np.sin(z * 1.7 + th * 7)
-                     + np.sin(th * 67 - z * 1.3) * np.sin(z * 2.3 - th * 11))
-                d = np.where(outer, -0.18 * (n * n), 0.0)
+                # peel pores on the outer skin only, applied along the surface normal
+                dist, nr, nzv = fr.outer_skin(r, z)
+                x, y = v[:, 0], v[:, 2]
+                n = (np.sin(1.9 * v[:, 0] + 0.7 * v[:, 2]) * np.sin(1.7 * v[:, 1] - 0.9 * v[:, 2])
+                     + np.sin(2.6 * v[:, 1] + 1.1 * v[:, 0]) * np.sin(2.3 * v[:, 2] - 0.8 * v[:, 1]))
+                amp = np.where(dist < 0.05, -0.17 * n * n, 0.0)
+                d = amp * nr
+                dz = amp * nzv
             else:
                 d = 0.0
             scale = np.where(r > 1e-6, (r + d) / np.maximum(r, 1e-6), 1.0)
             v[:, 0] *= scale
             v[:, 1] *= scale
+            v[:, 2] += dz
             return v
         return man.warp_batch(f)
 
@@ -265,8 +302,31 @@ class Fruit:
         length, lean, r = self.stem
         top = self.from_top(0.0)[1]
         t = np.linspace(0, 1, 14)
-        pts = np.c_[lean * t ** 1.6, np.zeros_like(t), top - 2.5 + (length + 2.5) * t]
-        return tube(pts, r, 16)
+        pts = np.c_[lean * t ** 1.6, np.zeros_like(t), top - 1.0 + (length + 1.0) * t]
+        stem = tube(pts, r, 16)
+        # slightly swollen woody tip
+        tip = Manifold.sphere(r * 1.15, 16).scale((1, 1, 0.8)).translate(tuple(pts[-1]))
+        return stem + tip
+
+    def make_sepals(self):
+        """Dried calyx star sitting in the bottom basin (apple / pear)."""
+        n, L, r0 = self.sepals
+        parts = []
+        for k in range(n):
+            phi = 2 * math.pi * k / n + 0.25
+            s = np.linspace(0.0, L, 8)
+            x, y, nx, ny = self.from_bottom(s)
+            rad = r0 * (1 - 0.75 * s / L)
+            off = 0.35 * rad          # half sunk into the skin
+            # sepals curl back toward the centre a little
+            x = x + off * nx
+            y = y + off * ny + 0.6 * np.sin(np.pi * s / L)
+            pts = np.c_[x * math.cos(phi), x * math.sin(phi), y]
+            balls = [Manifold.sphere(float(rr), 12).translate(tuple(p)) for p, rr in zip(pts, rad)]
+            parts += [Manifold.batch_hull([a, b]) for a, b in zip(balls[:-1], balls[1:])]
+        y0 = self.from_bottom(0.0)[1]
+        parts.append(Manifold.sphere(r0 * 0.9, 12).scale((1, 1, 0.6)).translate((0, 0, y0)))
+        return Manifold.batch_boolean(parts, m3d.OpType.Add)
 
     # ---- build ---------------------------------------------------------
     def build(self):
@@ -277,6 +337,8 @@ class Fruit:
             pits = self.seed_pits()
             base, lid = base - pits, lid - pits
         calyx = None
+        if self.sepals:
+            base = base + self.make_sepals()
         if self.stem:
             lid = lid + self.make_stem()
         if self.calyx:
@@ -332,27 +394,34 @@ class Fruit:
 
 # ------------------------------------------------------------------ catalogue
 FRUITS = [
-    Fruit('apple',
-          [(0, 0), (17, 0), (24, 1.6), (31, 5.5), (36, 13), (38.5, 24), (38.6, 34),
-           (37, 44), (33, 52.5), (26.5, 59), (19, 62.8), (12, 62.6), (6.5, 59.8),
-           (2.5, 57.6), (0, 57.2)],
-          zs=26, color='#d8322b', stem=(11.0, 3.2, 1.9)),
+    # profile control points: (radius, height) from the bottom axis up to the top axis
+    Fruit('apple',   # calyx basin underneath, deep stem cavity on top
+          [(0, 5.0), (3, 4.8), (6, 3.8), (9.5, 1.7), (13, 0.25), (17, 0), (23, 1.4),
+           (29.5, 5.3), (34.5, 11.8), (37.6, 20), (38.6, 30), (37.6, 40), (34.6, 48.5),
+           (29.5, 55.3), (22.5, 59.8), (15.5, 61.2), (10, 59.6), (5.5, 56.2),
+           (2.2, 54.2), (0, 53.8)],
+          zs=26, color='#d8322b', warp='apple', stem=(11.0, 3.0, 1.8),
+          sepals=(5, 6.5, 1.2)),
     Fruit('pear',
-          [(0, 0), (15, 0), (22, 1.8), (29, 7), (33.5, 15.5), (34.5, 25), (33, 34),
-           (28.5, 43), (22.5, 51), (18.3, 59), (16.4, 66), (14.4, 72.5), (10, 77.2),
-           (5, 78.6), (0, 78.4)],
-          zs=26, color='#8db83a', stem=(9.0, 2.2, 1.7)),
-    Fruit('peach',
-          [(0, 0), (15, 0), (23, 2.2), (30, 7.5), (34.8, 16), (36.4, 27), (35.8, 38),
-           (32.5, 48), (26.5, 56.5), (18, 62.5), (9, 66), (3.5, 67.6), (0, 68.6)],
+          [(0, 2.6), (3, 2.4), (6, 1.4), (10, 0.2), (15, 0), (22, 1.9), (28.5, 6.8),
+           (33, 14.8), (34.6, 24), (33.4, 33), (29.2, 42), (23.6, 50), (19.3, 58),
+           (17, 65), (14.8, 71.5), (10.8, 75.8), (6, 77.4), (2.4, 77.2), (0, 77)],
+          zs=26, color='#8db83a', warp='pear', stem=(9.5, 2.4, 1.6),
+          sepals=(5, 4.0, 0.9)),
+    Fruit('peach',   # rounded bottom with a tiny blossom point, stem cavity on top
+          [(0, 0), (4, 0.2), (10, 0.6), (18, 2.4), (26, 6.6), (32, 13.2), (35.6, 22),
+           (36.4, 31), (35.4, 40.5), (32, 49.5), (26, 56.6), (18.5, 61.4), (11, 63.4),
+           (6, 62.6), (2.6, 61.2), (0, 60.8)],
           zs=29, color='#f2a1a8', warp='peach'),
-    Fruit('orange',
-          [(0, 0), (16, 0), (25, 2.2), (32, 7.5), (36.6, 16), (38.2, 27), (37.2, 38),
-           (33.5, 48), (27, 55.6), (18, 60.3), (9, 62.2), (0, 62.6)],
+    Fruit('orange',  # navel dimple underneath, slightly oblate
+          [(0, 1.4), (2.5, 1.3), (5, 0.6), (9, 0.05), (14, 0), (20, 1.1), (27, 3.9),
+           (32.8, 9), (36.9, 17), (38.3, 26.5), (37.6, 36), (34.5, 45), (28.5, 52.4),
+           (20, 57.4), (11, 59.5), (5, 59.9), (2, 59.7), (0, 59.6)],
           zs=26, color='#f07c25', warp='orange', calyx=(5, 5.5, 3.2)),
-    Fruit('strawberry',
-          [(0, 0), (7, 0), (13, 2.6), (20, 8.5), (26.5, 17), (31.5, 27), (34, 37),
-           (34, 46), (31, 54), (24.5, 59.5), (15, 62.2), (6, 63), (0, 63.2)],
+    Fruit('strawberry',  # blunt tip, broad shoulders under the calyx
+          [(0, 0), (3, 0.1), (6.5, 0.9), (12, 3.6), (19, 9.2), (25.6, 17), (30.8, 26.4),
+           (33.6, 36.4), (33.8, 45.6), (31, 53.6), (24.6, 59.2), (15, 62), (7, 62.4),
+           (3, 61.5), (0, 61.2)],
           zs=29, color='#d72631', seeds=True, calyx=(7, 23.0, 8.5)),
 ]
 
